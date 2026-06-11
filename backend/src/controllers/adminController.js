@@ -1,19 +1,12 @@
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
 const Course = require("../models/Course");
-const AuditLog = require("../models/AuditLog");
+const { notifyAdmins, notifyUser } = require("../utils/notify");
+const { sendWelcomeEmail } = require("../utils/email");
 
-// ==================== USER MANAGEMENT ====================
-
-/**
- * Get all users with filtering and search
- * GET /api/admin/users?role=student&search=john
- */
 const getUsers = async (req, res) => {
   try {
-    const { role, search, page = 1, limit = 10, sortBy = "createdAt" } = req.query;
-    const skip = (page - 1) * limit;
-    
+    const { role, search } = req.query;
     const filter = {};
     if (role) filter.role = role;
     if (search) {
@@ -23,77 +16,64 @@ const getUsers = async (req, res) => {
         { username: { $regex: search, $options: "i" } },
       ];
     }
-
-    const users = await User.find(filter)
-      .select("-password")
-      .sort({ [sortBy]: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
-
-    const total = await User.countDocuments(filter);
-
-    res.json({
-      success: true,
-      users,
-      pagination: {
-        total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / limit),
-      },
-    });
+    const users = await User.find(filter).select("-password").sort({ createdAt: -1 });
+    res.json({ users });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
 
-/**
- * Create a new user (Admin only)
- * POST /api/admin/users
- * Body: { fullName, email, username, password, role }
- */
 const createUser = async (req, res) => {
   try {
-    const { fullName, email, username, password, role = "student" } = req.body;
-
-    // Validation
-    if (!fullName || !email || !username) {
-      return res.status(400).json({
-        success: false,
-        message: "fullName, email, and username are required",
-      });
+    const { fullName, email, username, password, role } = req.body;
+    
+    // Validate required fields
+    if (!fullName || !email || !username || !role) {
+      return res.status(400).json({ message: "fullName, email, username, and role are required" });
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({
-      $or: [{ email }, { username }],
+    const existing = await User.findOne({
+      $or: [{ email: email.toLowerCase() }, { username: username.toLowerCase() }],
     });
-
-    if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: "Email or username already exists",
-      });
+    if (existing) {
+      const field = existing.email === email.toLowerCase() ? "email" : "username";
+      return res.status(409).json({ message: `User with this ${field} already exists` });
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password || "password123", 10);
-
-    // Create user
+    // Hash password (use provided password or generate a default)
+    const hashedPassword = await bcrypt.hash(password || "TempPassword@123", 10);
+    
     const user = await User.create({
       fullName,
       email: email.toLowerCase(),
       username: username.toLowerCase(),
       password: hashedPassword,
-      role: role || "student",
+      role,
     });
 
-    // Log audit
-    await logAudit(req.user._id, "CREATE_USER", user._id, `Created user: ${user.fullName}`);
+    // Send welcome email to the newly created user
+    try {
+      await sendWelcomeEmail(
+        user.email,
+        user.fullName,
+        user.username,
+        role,
+        password || "TempPassword@123"
+      );
+    } catch (emailError) {
+      console.error("Welcome email send failed:", emailError);
+      // Don't fail the user creation if email fails
+    }
+
+    // Notify admins about new user creation
+    await notifyAdmins(
+      "New User Added",
+      `${req.user.fullName} added a new ${role}: ${fullName} (${email})`,
+      "/admin/users"
+    );
 
     res.status(201).json({
-      success: true,
-      message: "User created successfully",
       user: {
         id: user._id,
         fullName: user.fullName,
@@ -102,211 +82,117 @@ const createUser = async (req, res) => {
         role: user.role,
         createdAt: user.createdAt,
       },
+      message: `${role} account created and welcome email sent`,
     });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(400).json({ message: error.message });
   }
 };
 
-/**
- * Get single user by ID
- * GET /api/admin/users/:id
- */
-const getUserById = async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id).select("-password");
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    res.json({ success: true, user });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-/**
- * Update user (Edit user details)
- * PATCH /api/admin/users/:id
- * Body: { fullName, email, username, role, isSuspended, etc. }
- */
 const updateUser = async (req, res) => {
   try {
-    const { id } = req.params;
     const updates = { ...req.body };
-    const allowedFields = ["fullName", "email", "username", "role", "isSuspended", "profilePic", "bio"];
+    delete updates.password; // Don't allow password update through this endpoint
     
-    // Only allow specific fields to be updated
-    const filteredUpdates = {};
-    allowedFields.forEach((field) => {
-      if (updates[field] !== undefined) {
-        filteredUpdates[field] = updates[field];
-      }
-    });
-
-    // If password is being updated
     if (req.body.password) {
-      filteredUpdates.password = await bcrypt.hash(req.body.password, 10);
+      updates.password = await bcrypt.hash(req.body.password, 10);
     }
 
-    // Check for duplicate email/username if they're being updated
-    if (updates.email || updates.username) {
-      const existingUser = await User.findOne({
-        $or: [
-          { email: updates.email, _id: { $ne: id } },
-          { username: updates.username, _id: { $ne: id } },
-        ],
-      });
+    const user = await User.findByIdAndUpdate(req.params.id, updates, { new: true }).select("-password");
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-      if (existingUser) {
-        return res.status(409).json({
-          success: false,
-          message: "Email or username already exists",
-        });
-      }
-    }
-
-    const user = await User.findByIdAndUpdate(id, filteredUpdates, {
-      new: true,
-      runValidators: true,
-    }).select("-password");
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
+    // Notify user of profile update
+    if (Object.keys(updates).length > 0) {
+      await notifyUser(user._id, user.email, {
+        type: "system",
+        title: "Profile Updated",
+        message: "Your profile has been updated by an administrator",
       });
     }
 
-    // Log audit
-    await logAudit(req.user._id, "UPDATE_USER", user._id, `Updated user: ${user.fullName}`);
-
-    res.json({
-      success: true,
-      message: "User updated successfully",
-      user,
-    });
+    res.json({ user });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(400).json({ message: error.message });
   }
 };
 
-/**
- * Delete user
- * DELETE /api/admin/users/:id
- */
 const deleteUser = async (req, res) => {
   try {
-    const { id } = req.params;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    const user = await User.findById(id);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    // Prevent deleting the last admin
-    if (user.role === "admin") {
-      const adminCount = await User.countDocuments({ role: "admin" });
-      if (adminCount === 1) {
-        return res.status(400).json({
-          success: false,
-          message: "Cannot delete the last admin user",
-        });
-      }
-    }
-
-    await User.findByIdAndDelete(id);
-
-    // Log audit
-    await logAudit(req.user._id, "DELETE_USER", id, `Deleted user: ${user.fullName}`);
-
-    res.json({
-      success: true,
-      message: "User deleted successfully",
+    // Notify the user before deletion
+    await notifyUser(user._id, user.email, {
+      type: "system",
+      title: "Account Deleted",
+      message: "Your account has been deleted by an administrator. If you believe this is a mistake, please contact support.",
     });
+
+    await user.deleteOne();
+
+    // Notify admins
+    await notifyAdmins(
+      "User Deleted",
+      `${req.user.fullName} deleted user: ${user.fullName} (${user.email})`,
+      "/admin/users"
+    );
+
+    res.json({ message: "User deleted successfully" });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
 
-/**
- * Suspend/Unsuspend user
- * PATCH /api/admin/users/:id/suspend
- * Body: { suspend: true/false }
- */
-const toggleUserSuspension = async (req, res) => {
+const suspendUser = async (req, res) => {
   try {
-    const { id } = req.params;
-    const { suspend } = req.body;
-
     const user = await User.findByIdAndUpdate(
-      id,
-      { isSuspended: suspend },
+      req.params.id,
+      { isSuspended: true },
       { new: true }
     ).select("-password");
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-    const action = suspend ? "SUSPEND_USER" : "UNSUSPEND_USER";
-    await logAudit(req.user._id, action, user._id, `${suspend ? "Suspended" : "Unsuspended"} user: ${user.fullName}`);
-
-    res.json({
-      success: true,
-      message: `User ${suspend ? "suspended" : "unsuspended"} successfully`,
-      user,
+    // Notify user of suspension
+    await notifyUser(user._id, user.email, {
+      type: "system",
+      title: "Account Suspended",
+      message: "Your account has been suspended. Please contact support for more information.",
     });
+
+    res.json({ user, message: "User suspended" });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
 
-/**
- * Get user statistics
- * GET /api/admin/users/stats/overview
- */
-const getUserStats = async (_req, res) => {
+const unsuspendUser = async (req, res) => {
   try {
-    const totalUsers = await User.countDocuments();
-    const students = await User.countDocuments({ role: "student" });
-    const instructors = await User.countDocuments({ role: "instructor" });
-    const admins = await User.countDocuments({ role: "admin" });
-    const suspendedUsers = await User.countDocuments({ isSuspended: true });
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { isSuspended: false },
+      { new: true }
+    ).select("-password");
 
-    res.json({
-      success: true,
-      stats: {
-        totalUsers,
-        students,
-        instructors,
-        admins,
-        suspendedUsers,
-        activeUsers: totalUsers - suspendedUsers,
-      },
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // Notify user of restoration
+    await notifyUser(user._id, user.email, {
+      type: "system",
+      title: "Account Restored",
+      message: "Your account has been restored and is now active.",
     });
+
+    res.json({ user, message: "User unsuspended" });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
-
-// ==================== COURSE MANAGEMENT ====================
 
 const getPendingCourses = async (_req, res) => {
   try {
     const courses = await Course.find({ status: "pending" }).populate("instructor", "fullName email");
     res.json({
-      success: true,
       courses: courses.map((c) => ({
         id: c._id,
         title: c.title,
@@ -319,7 +205,7 @@ const getPendingCourses = async (_req, res) => {
       })),
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
 
@@ -329,7 +215,6 @@ const getManagedCoursesHistory = async (_req, res) => {
       status: { $in: ["published", "rejected"] },
     }).populate("instructor", "fullName email");
     res.json({
-      success: true,
       courses: courses.map((c) => ({
         id: c._id,
         title: c.title,
@@ -344,63 +229,17 @@ const getManagedCoursesHistory = async (_req, res) => {
       })),
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ==================== AUDIT LOGGING ====================
-
-/**
- * Helper function to log audit trail
- */
-const logAudit = async (adminId, action, targetId, description) => {
-  try {
-    await AuditLog.create({
-      adminId,
-      action,
-      targetId,
-      description,
-      timestamp: new Date(),
-    });
-  } catch (error) {
-    console.error("Audit logging error:", error);
-  }
-};
-
-/**
- * Get audit logs
- * GET /api/admin/audit-logs
- */
-const getAuditLogs = async (_req, res) => {
-  try {
-    const logs = await AuditLog.find()
-      .populate("adminId", "fullName email")
-      .sort({ timestamp: -1 })
-      .limit(100);
-
-    res.json({
-      success: true,
-      logs,
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ message: error.message });
   }
 };
 
 module.exports = {
-  // User Management
   getUsers,
   createUser,
-  getUserById,
   updateUser,
   deleteUser,
-  toggleUserSuspension,
-  getUserStats,
-
-  // Course Management
+  suspendUser,
+  unsuspendUser,
   getPendingCourses,
   getManagedCoursesHistory,
-
-  // Audit
-  getAuditLogs,
 };
