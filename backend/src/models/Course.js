@@ -35,6 +35,16 @@ const courseSchema = new mongoose.Schema(
     tags: [{ type: String }],
     modules: [moduleSchema],
     rejectionReason: { type: String, default: "" },
+    // Track edit history for admins
+    editHistory: [
+      {
+        editedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        editedByName: { type: String },
+        editedAt: { type: Date, default: Date.now },
+        changes: { type: String }, // Description of what changed
+      },
+    ],
+    canBeEditedAfterPublish: { type: Boolean, default: true }, // Admin/Instructor can edit even after publish
   },
   { timestamps: true }
 );
